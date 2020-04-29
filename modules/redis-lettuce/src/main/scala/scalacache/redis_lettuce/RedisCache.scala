@@ -14,14 +14,19 @@ import scala.concurrent.duration.Duration
 class RedisCache[V](pool: AsyncPool[StatefulRedisConnection[String, V]])(implicit val config: CacheConfig) extends AbstractCache[V] {
   override protected def doGet[F[_]](key: String)(implicit mode: Mode[F]): F[Option[V]] =
     withCommands { commands =>
-      commands.get(key).thenApply(value => Option(value))
+      commands.get(key).thenApply { value =>
+          val maybeValue = Option(value)
+          logCacheHitOrMiss(key, maybeValue)
+          maybeValue
+      }
     }
 
 
   override protected def doPut[F[_]](key: String, value: V, ttl: Option[Duration])(implicit mode: Mode[F]): F[Any] =
     withCommands { commands =>
-      ttl.fold(commands.set(key, value)) { expire =>
-        val expiryArgs = SetArgs.Builder.ex(expire.toSeconds)
+      logCachePut(key, ttl)
+      ttl.filterNot(_ == Duration.Zero).fold(commands.set(key, value)) { expire =>
+        val expiryArgs = SetArgs.Builder.px(expire.toMillis)
         commands.set(key, value, expiryArgs)
       }.asInstanceOf[CompletionStage[Any]]
     }
@@ -44,10 +49,13 @@ class RedisCache[V](pool: AsyncPool[StatefulRedisConnection[String, V]])(implici
                                    (implicit mode: Mode[F]): F[T] = mode.M.async { callback =>
     pool.acquire().thenCompose { connection =>
       val commands = connection.async()
-      f(commands).whenCompleteAsync { (result, throwable) =>
-        val either = if (throwable != null) Left(throwable) else Right(result)
-        pool.release(connection).whenComplete((_, _) => callback(either))
+      f(commands).thenCompose { result =>
+        callback(Right(result))
+        pool.release(connection)
       }
+    }.exceptionally { error =>
+      callback(Left(error))
+      null
     }
   }
 }

@@ -15,11 +15,13 @@ import scalacache.Cache
 import scalacache.modes.scalaFuture._
 import scalacache.redis_lettuce.RedisCache
 import scalacache.serialization.Codec
-import scalacache.serialization.binary.{IntBinaryCodec, StringBinaryCodec}
+import scalacache.serialization.binary._
 
 import scala.concurrent.ExecutionContext.Implicits.global
 import scala.concurrent.Future
 import scala.concurrent.duration._
+
+case class CaseClass(a: Int, b: String) extends Serializable
 
 class RedisCacheSpec extends FlatSpec with Matchers with ScalaFutures with Eventually with BeforeAndAfterAll
   with ForAllTestContainer with IntegrationPatience with RedisCacheUtils {
@@ -37,13 +39,14 @@ class RedisCacheSpec extends FlatSpec with Matchers with ScalaFutures with Event
 
   container.start()
   implicit val redisUri = RedisURI.create(s"redis://${container.containerIpAddress}:${container.mappedPort(6379)}/0")
+  implicit val stringCodec: RedisCodec[String, String] = StringCodec.UTF8
   implicit def scalacacheCodecToRedis[T](implicit codec: Codec[T]): RedisCodec[String, T] = new RedisCodec[String, T] {
     override def decodeKey(bytes: ByteBuffer): String = StringCodec.UTF8.decodeKey(bytes)
-    override def decodeValue(bytes: ByteBuffer): T =
-      if (bytes.isReadOnly) ???
-      else if (bytes.hasArray)
-        codec.decode(bytes.array()).getOrElse(???)
-      else null.asInstanceOf[T]
+    override def decodeValue(bytes: ByteBuffer): T = {
+      val byteArray = Array.ofDim[Byte](bytes.remaining())
+      bytes.get(byteArray)
+      codec.decode(byteArray).getOrElse(???)
+    }
     override def encodeKey(key: String): ByteBuffer = StringCodec.UTF8.encodeKey(key)
     override def encodeValue(value: T): ByteBuffer = ByteBuffer.wrap(codec.encode(value))
   }
@@ -86,6 +89,64 @@ class RedisCacheSpec extends FlatSpec with Matchers with ScalaFutures with Event
       client.connect().sync().get(key) shouldBe null
     }
   }
+
+  it should "put with zero ttl" in withCache[String, Assertion] { cache =>
+    val key = "put"
+    val value = "value"
+    whenReady(cache.put(key)(value, Some(Duration.Zero))) { _ =>
+      client.connect().sync().get(key) shouldBe value
+      client.connect().sync().ttl(key) shouldBe -1
+    }
+  }
+
+  it should "put with TTL of less than 1 second and expire" in withCache[String, Assertion] { cache =>
+    val key = "key"
+    val cacheValue = "value"
+    whenReady(cache.put(key)(cacheValue, Some(800.milliseconds))) { _ =>
+      client.connect().sync().get(key) shouldBe cacheValue
+      client.connect().sync().pttl(key).toLong should be > 0L
+
+      eventually {
+        client.connect().sync().get(key) shouldBe null
+      }
+    }
+  }
+
+  behavior of "serialization"
+
+  def roundTrip[V](cache: Cache[V],  key: String, value: V)(implicit codec: RedisCodec[String, V]): Future[Option[V]] =
+      for {
+        _ <- cache.put(key)(value)
+        result <- cache.get(key)
+      } yield result
+
+  it should "round-trip a String" in withCache[String, Assertion] { cache =>
+    whenReady(roundTrip(cache, "string", "hello")) { _ should be(Some("hello")) }
+  }
+
+  it should "round-trip a byte array" in withCache[Array[Byte], Assertion] { cache =>
+    whenReady(roundTrip(cache, "bytearray", "world".getBytes("utf-8"))) { result =>
+      new String(result.get, "UTF-8") should be("world")
+    }
+  }
+
+  it should "round-trip an Int" in withCache[Int, Assertion] { cache =>
+    whenReady(roundTrip(cache, "int", 345)) { _ should be(Some(345)) }
+  }
+
+  it should "round-trip a Double" in withCache[Double, Assertion] { cache =>
+    whenReady(roundTrip(cache, "double", 1.23)) { _ should be(Some(1.23)) }
+  }
+
+  it should "round-trip a Long" in withCache[Long, Assertion] { cache =>
+    whenReady(roundTrip(cache, "long", 3456L)) { _ should be(Some(3456L)) }
+  }
+
+  it should "round-trip a Serializable case class" in withCache[CaseClass, Assertion] { cache =>
+    val cc = CaseClass(123, "wow")
+    whenReady(roundTrip(cache, "caseclass", cc)) { _ should be(Some(cc)) }
+  }
+
 
   behavior of "caching"
   it should "cache computation" in withCache[Int, Assertion] { cache =>
