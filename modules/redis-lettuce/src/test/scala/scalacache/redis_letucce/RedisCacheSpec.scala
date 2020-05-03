@@ -4,9 +4,9 @@ import java.nio.ByteBuffer
 import java.util.concurrent.atomic.AtomicInteger
 
 import com.dimafeng.testcontainers.{ForAllTestContainer, GenericContainer}
-import io.lettuce.core.api.StatefulRedisConnection
 import io.lettuce.core.codec.{RedisCodec, StringCodec}
-import io.lettuce.core.support.{AsyncConnectionPoolSupport, AsyncPool, BoundedAsyncPool, BoundedPoolConfig}
+import io.lettuce.core.resource.{ClientResources, DefaultClientResources}
+import io.lettuce.core.support.BoundedPoolConfig
 import io.lettuce.core.{RedisClient, RedisURI}
 import org.scalatest.concurrent.{Eventually, IntegrationPatience, ScalaFutures}
 import org.scalatest.{Assertion, BeforeAndAfterAll, FlatSpec, Matchers}
@@ -51,7 +51,11 @@ class RedisCacheSpec extends FlatSpec with Matchers with ScalaFutures with Event
     override def encodeValue(value: T): ByteBuffer = ByteBuffer.wrap(codec.encode(value))
   }
 
-  implicit val client = RedisClient.create(redisUri)
+  implicit val clientResources: ClientResources = ClientResources.builder()
+      .ioThreadPoolSize(DefaultClientResources.MIN_IO_THREADS)
+      .computationThreadPoolSize(DefaultClientResources.MIN_COMPUTATION_THREADS)
+      .build()
+  val client = RedisClient.create(redisUri)
 
   behavior of "get"
   it should "return None if key is absent" in withCache[String, Assertion] { cache =>
@@ -165,34 +169,23 @@ class RedisCacheSpec extends FlatSpec with Matchers with ScalaFutures with Event
 }
 
 trait RedisCacheUtils {
-  def withCache[V, T](f: Cache[V] => T)(implicit client: RedisClient, codec: RedisCodec[String, V], uri: RedisURI): T = {
-    withAsyncPool[V, T] { pool =>
+  def withCache[V, T](f: Cache[V] => T)(implicit codec: RedisCodec[String, V], uri: RedisURI, clientResources: ClientResources): T = {
+    withClient { client =>
       client.connect(uri).sync().flushdb()
-      val cache = new RedisCache[V](pool)
-      f(cache)
     }
+    val boundedPoolConfig = BoundedPoolConfig.builder()
+      .maxTotal(1)
+      .build()
+    val cache = RedisCache[V](uri, clientResources, boundedPoolConfig)
+    f(cache)
   }
 
-  def withClient[T](f: RedisClient => T)(implicit uri: RedisURI): T = {
-    val client = RedisClient.create(uri)
+  def withClient[T](f: RedisClient => T)(implicit uri: RedisURI, clientResources: ClientResources): T = {
+    val client = RedisClient.create(clientResources, uri)
     try {
       f(client)
     } finally {
       client.shutdown()
-    }
-  }
-
-  private def withAsyncPool[V, T](f: AsyncPool[StatefulRedisConnection[String, V]] => T)
-                         (implicit client: RedisClient, codec: RedisCodec[String, V], uri: RedisURI): T = {
-    val pool: BoundedAsyncPool[StatefulRedisConnection[String, V]] =
-      AsyncConnectionPoolSupport.createBoundedObjectPool(
-        () => client.connectAsync(codec, uri),
-        BoundedPoolConfig.create()
-      )
-    try {
-      f(pool)
-    } finally {
-      pool.close()
     }
   }
 }
