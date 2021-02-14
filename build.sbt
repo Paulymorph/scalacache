@@ -86,6 +86,14 @@ lazy val redis = jvmOnlyModule("redis")
     coverageFailOnMinimum := true
   )
 
+lazy val `redis-lettuce` = jvmOnlyModule("redis-lettuce")
+  .settings (
+    libraryDependencies ++= Seq(
+      "io.lettuce" % "lettuce-core" % "5.2.2.RELEASE",
+      "com.dimafeng" %% "testcontainers-scala-scalatest" % "0.36.1" % Test,
+    )
+  )
+
 lazy val caffeine = jvmOnlyModule("caffeine")
   .settings(
     libraryDependencies ++= Seq(
